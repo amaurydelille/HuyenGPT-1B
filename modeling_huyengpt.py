@@ -1,10 +1,27 @@
 import torch
 import torch.nn as nn
-import torch.functional as F
+import torch.nn.functional as F
 from typing import Tuple
+from transformers import AutoTokenizer
 
-N_EXPERTS=8
+# model variants
+VARIANT="small"
+TOKENIZER_NAME="google/mt5-small"
+
+# model parameters
+D_MODEL=8192 if VARIANT=="large" else 4096 if VARIANT=="medium" else 2048 if VARIANT=="small" else 1024
+D_HIDDEN=14336 if VARIANT=="large" else 7168 if VARIANT=="medium" else 3584 if VARIANT=="small" else 1792
+N_LATENTS=32 if VARIANT=="large" else 16 if VARIANT=="medium" else 8 if VARIANT=="small" else 4
+D_LATENT=4096 if VARIANT=="large" else 2048 if VARIANT=="medium" else 1024 if VARIANT=="small" else 512
+N_HEADS=32
+N_LAYERS=32 if VARIANT=="large" else 16 if VARIANT=="medium" else 8 if VARIANT=="small" else 4
+N_EXPERTS=8 if VARIANT=="large" else 4 if VARIANT=="medium" else 2 if VARIANT=="small" else 1
 ACTIVE_EXPERTS_PER_TOKEN=2
+DEVICE="cuda" if torch.cuda.is_available() else "mps"
+
+
+
+tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
 
 class RoPE:
     @staticmethod
@@ -44,7 +61,7 @@ class MultiLatentHeadAttention(nn.Module):
         self.d_h = d_latent // n_heads
 
         # latent set
-        self.L = nn.Parameter(torch.randn(n_latents, d_latent))
+        self.L = nn.Parameter(torch.randn(n_latents, d_latent) * (d_latent ** -0.5))
 
         # projections
         self.q_lat = nn.Linear(d_latent, d_latent, bias=False)    # queries from latents
@@ -72,7 +89,7 @@ class MultiLatentHeadAttention(nn.Module):
         weights = F.softmax(scores, dim=-1)
         return weights @ V
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         B, N, _ = x.shape
 
         # expand latents per batch
@@ -81,6 +98,7 @@ class MultiLatentHeadAttention(nn.Module):
         # compression: latents attend to inputs
         Q = self._split_heads(self.q_lat(L))
         K = self._split_heads(self.k_in(x))
+        K = RoPE.apply_rope(K, cos=cos, sin=sin)       
         V = self._split_heads(self.v_in(x))
         z = self._merge_heads(self._attn(Q, K, V))  # [B, n_latents, d_latent]
 
@@ -92,6 +110,7 @@ class MultiLatentHeadAttention(nn.Module):
 
         # decompression: tokens attend to latents
         Qx = self._split_heads(self.q_in(x))
+        Qx = RoPE.apply_rope(Qx, cos=cos, sin=sin)
         Kz = self._split_heads(self.k_lat(z2))
         Vz = self._split_heads(self.v_lat(z2))
         x_latent = self._merge_heads(self._attn(Qx, Kz, Vz))  # [B, N, d_latent]
@@ -111,8 +130,10 @@ class SwiGLU(nn.Module):
         self.d_model = d_model
         self.d_hidden = d_hidden
 
-        self.W = nn.Parameter(torch.randn(d_model, d_hidden))
-        self.V = nn.Parameter(torch.randn(d_model, d_hidden))
+        # Xavier initialization: scale by 1/sqrt(fan_in)
+        self.W = nn.Parameter(torch.randn(d_model, d_hidden) * (d_model ** -0.5))
+        self.V = nn.Parameter(torch.randn(d_model, d_hidden) * (d_model ** -0.5))
+        self.W_out = nn.Parameter(torch.randn(d_hidden, d_model) * (d_hidden ** -0.5))
 
     def __swish(self, x: torch.Tensor) -> torch.Tensor:
         return x * F.sigmoid(x)
@@ -120,8 +141,17 @@ class SwiGLU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         a = x @ self.W
         b = x @ self.V
+        hidden = a * self.__swish(b)
+        return hidden @ self.W_out  # project back to d_model
 
-        return a * self.__swish(b)
+class ResidualConnection(nn.Module):
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.layer_norm = LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        return self.layer_norm(x) + y
     
 class LayerNorm(nn.Module):
     def __init__(self, d_model: int) -> None:
@@ -139,14 +169,18 @@ class LayerNorm(nn.Module):
 class MixtureOfExperts(nn.Module):
     """Mixture of Experts layer with top-k routing and SwiGLU feed-forward experts."""
 
-    def __init__(self, d_module: int, d_hidden: int, n_experts: int, top_k: int) -> None:
+    def __init__(self, d_model: int, d_hidden: int, n_experts: int, top_k: int) -> None:
         assert top_k <= n_experts, "top_k cannot be greater than n_experts."
         super().__init__()
 
+        self.d_model = d_model
+        self.d_hidden = d_hidden
+        self.n_experts = n_experts
+        self.top_k = top_k
         self.experts = nn.ModuleList([
             SwiGLU(d_model=d_model, d_hidden=d_hidden) for _ in range(n_experts)
         ])
-        self.router = nn.Linear(in_features=d_module, out_features=n_experts)
+        self.router = nn.Linear(in_features=d_model, out_features=n_experts)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -162,56 +196,65 @@ class MixtureOfExperts(nn.Module):
         """
         B, T, D = x.shape
         N = B * T
-        x_flat = x.view(N, D) # flatten tokens
+        x_flat = x.view(N, D)  # flatten tokens
 
-        router_logits = self.router(x) 
-        top_k_logits, top_k_ids = torch.topk(router_logits, k=self.top_k, dim=-1)
-        top_k_probs = F.softmax(top_k_logits, dim=-1) # final probabilities after softmax
+        router_logits = self.router(x_flat)  # [N, n_experts]
+        top_k_logits, top_k_ids = torch.topk(router_logits, k=self.top_k, dim=-1)  # [N, top_k]
+        top_k_probs = F.softmax(top_k_logits, dim=-1)  # [N, top_k]
 
-        output = torch.zeros(D)
+        output = torch.zeros(N, D, device=x.device, dtype=x.dtype)
 
         for expert_id, expert in enumerate(self.experts):
-            mask = (top_k_ids == expert_id) # mask to find tokens assigned to this expert
-            token_idx = mask.any(dim=-1).nonzero(as_tuple=True)[0]
+            mask = (top_k_ids == expert_id)  # [N, top_k] - which slots have this expert
+            token_idx, slot_idx = mask.nonzero(as_tuple=True)  # tokens and their slots assigned to this expert
 
-            if len(token_idx) == 0: # no tokens for this expert
+            if len(token_idx) == 0:
                 continue
 
-            token_positions = mask[token_idx].nonzero(as_tuple=False)
-            rows = token_positions[:, 0]
-            cols = token_positions[:, 1]
-            weights = top_k_probs[token_idx, cols].unsqueeze(-1)
+            weights = top_k_probs[token_idx, slot_idx].unsqueeze(-1)  # [num_tokens, 1]
+            x_input = x_flat[token_idx]  # [num_tokens, D]
+            y = expert(x_input)  # [num_tokens, D]
 
-            x_input = x_flat[rows]
-            y = expert(x_input)
-
-            output[rows] += y * weights
+            output.index_add_(0, token_idx, y * weights)
 
         return output.view(B, T, D)
         
 class DecoderLayer(nn.Module):
-    def __init__(self, d_model: int, n_latents: int, d_latent: int, n_heads: int, n_layers: int) -> None:
+    def __init__(self, d_model: int, d_hidden: int, n_latents: int, d_latent: int, n_heads: int, n_layers: int, n_experts: int, top_k: int) -> None:
         super().__init__()
-        pass
+        
+        self.residual_connection_1 = ResidualConnection(d_model=d_model)
+        self.mlha = MultiLatentHeadAttention(d_model=d_model, n_latents=n_latents, d_latent=d_latent, n_heads=n_heads)
+        self.residual_connection_2 = ResidualConnection(d_model=d_model)
+        self.moe = MixtureOfExperts(d_model=d_model, d_hidden=d_hidden, n_experts=n_experts, top_k=top_k)
+        self.residual_connection_3 = ResidualConnection(d_model=d_model)
+        self.linear = nn.Linear(in_features=d_model, out_features=d_model)
+
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        x = self.residual_connection_1(x, self.mlha(x, cos, sin))
+        x = self.residual_connection_2(x, self.moe(x))
+        x = self.residual_connection_3(x, self.linear(x))
+        return x
 
 class Decoder(nn.Module):
-    def __init__(self, d_model: int, n_latents: int, d_latent: int, n_heads: int, n_layers: int) -> None:
+    def __init__(self, d_model: int, d_hidden: int, n_latents: int, d_latent: int, n_heads: int, n_layers: int, n_experts: int, top_k: int) -> None:
         super().__init__()
-        head_dim = d_model // n_heads
-        cos, sin = RoPE.build_rope_cache(max_seq_length=1024, head_dim=head_dim, device=torch.device("cuda"))
+        head_dim = d_latent // n_heads  # RoPE is applied in latent space
+        cos, sin = RoPE.build_rope_cache(max_seq_length=1024, head_dim=head_dim, device=torch.device(DEVICE))
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
         self.layers = nn.ModuleList([
-            DecoderLayer(d_model=d_model, n_latents=n_latents, d_latent=d_latent, n_heads=n_heads, n_layers=n_layers) for _ in range(n_layers)
+            DecoderLayer(d_model=d_model, d_hidden=d_hidden, n_latents=n_latents, d_latent=d_latent, n_heads=n_heads, n_layers=n_layers, n_experts=n_experts, top_k=top_k) for _ in range(n_layers)
         ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = RoPE.apply_rope(x, self.cos, self.sin)
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, self.cos, self.sin)
         return x
 
 
 if __name__ == "__main__":
-    d_model = 4
-    X = torch.randn(1, 3, d_model)
+    X = torch.randn(1, 3, D_MODEL, device=torch.device(DEVICE))
+    decoder = Decoder(d_model=D_MODEL, d_hidden=D_HIDDEN, n_latents=N_LATENTS, d_latent=D_LATENT, n_heads=N_HEADS, n_layers=N_LAYERS, n_experts=N_EXPERTS, top_k=ACTIVE_EXPERTS_PER_TOKEN).to(DEVICE)
+    print(sum(p.numel() for p in decoder.parameters()))
+    print(decoder(X).sum())
