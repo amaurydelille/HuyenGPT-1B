@@ -672,9 +672,12 @@ class Trainer:
             loss = loss / self.gradient_accumulation_steps
             loss.backward()
             
-            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+            # Step optimizer if accumulated enough, OR if this is the last batch
+            is_accumulation_step = (batch_idx + 1) % self.gradient_accumulation_steps == 0
+            is_last_batch = (batch_idx + 1) == num_batches
+            
+            if is_accumulation_step or is_last_batch:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                
                 self.optimizer.step()
                 self.optimizer.zero_grad()
                 self.global_step += 1
@@ -704,7 +707,10 @@ class Trainer:
         
         base = self.checkpoint_dir / f"huyengpt_epoch_{epoch + 1}"
         torch.save(state, str(base.with_suffix(".pth")))
-        save_file(self.model.state_dict(), str(base.with_suffix(".safetensors")))
+        
+        # For safetensors: clone tensors to avoid shared memory issue (tied weights)
+        state_dict_cloned = {k: v.clone() for k, v in self.model.state_dict().items()}
+        save_file(state_dict_cloned, str(base.with_suffix(".safetensors")))
         
         if is_best:
             best_path = self.checkpoint_dir / "huyengpt_best.pth"
@@ -766,7 +772,7 @@ if __name__ == "__main__":
 
     # ========== Configuration ==========
     BATCH_SIZE = 4
-    EPOCHS = 3
+    EPOCHS = 10
     LEARNING_RATE = 1e-4
     MAX_SEQ_LENGTH = 512
     GRADIENT_ACCUMULATION_STEPS = 4  # Effective batch size = 4 * 4 = 16
@@ -785,12 +791,10 @@ if __name__ == "__main__":
         output_column=["candidates_completions_vi"]
     )
 
-    # Extract prompts and responses
     prompts = df[dataset_config.input_column[0]].tolist()
     responses = df[dataset_config.output_column[0]].tolist()
     
-    # Limit dataset for testing (remove this for full training)
-    MAX_SAMPLES = 1000  # Set to None for full dataset
+    MAX_SAMPLES = None  # Set to None for full dataset
     if MAX_SAMPLES:
         prompts = prompts[:MAX_SAMPLES]
         responses = responses[:MAX_SAMPLES]
