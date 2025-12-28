@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from typing import Tuple, List
 from transformers import AutoTokenizer
 import torch.utils.data as data
-from safetensors.torch import save_file
+from safetensors.torch import save_file, load_file
 
 import logging
 import time
@@ -592,7 +592,7 @@ class HuyenGPT(nn.Module):
             )
         
         return logits, loss
-    
+        
     @torch.no_grad()
     def generate(
         self,
@@ -601,9 +601,12 @@ class HuyenGPT(nn.Module):
         temperature: float = 1.0,
         top_k: int = 50,
         eos_token_id: int = None,
-    ) -> torch.Tensor:
+    ):
         """
-        Autoregressive text generation.
+        Autoregressive text generation with streaming.
+        
+        Yields:
+            int: Token ID for each generated token (does NOT include input tokens)
         """
         self.eval()
         
@@ -619,13 +622,131 @@ class HuyenGPT(nn.Module):
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)  # [B, 1]
             
-            input_ids = torch.cat([input_ids, next_token], dim=1)
+            token_id = next_token.item()
+            yield token_id
             
-            if eos_token_id is not None and (next_token == eos_token_id).all():
+            if eos_token_id is not None and token_id == eos_token_id:
                 break
+            
+            input_ids = torch.cat([input_ids, next_token], dim=1)
+    
+    @classmethod
+    def from_pretrained(
+        cls,
+        checkpoint_path: str,
+        device: str = "cpu",
+    ) -> "HuyenGPT":
+        """
+        Load a pretrained model from a checkpoint file.
         
-        return input_ids
+        Args:
+            checkpoint_path: Path to .pth, .bin, or .safetensors file
+            device: Device to load model on ("cpu", "cuda", "mps")
+            
+        Returns:
+            HuyenGPT: Loaded model ready for inference
+        """
+        from safetensors.torch import load_file
+        
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        
+        # ... existing code in from_pretrained method ...
 
+        suffix = checkpoint_path.suffix.lower()
+        device = torch.device(device)
+        
+        def get_config_from_d_model(d_model):
+            for variant, cfg in MODEL_CONFIGS.items():
+                if cfg["d_model"] == d_model:
+                    return cfg
+            return MODEL_CONFIGS[VARIANT]
+        
+        if suffix == ".safetensors":
+            state_dict = load_file(str(checkpoint_path))
+            vocab_size = state_dict["embedding.weight"].shape[0]
+            d_model = state_dict["embedding.weight"].shape[1]
+            cfg = get_config_from_d_model(d_model)
+            model = cls(
+                vocab_size=vocab_size,
+                d_model=d_model,
+                d_hidden=cfg["d_hidden"],
+                n_latents=cfg["n_latents"],
+                d_latent=cfg["d_latent"],
+                n_heads=cfg["n_heads"],
+                n_layers=cfg["n_layers"],
+                n_experts=cfg["n_experts"],
+                top_k=min(2, cfg["n_experts"]),
+            )
+            model.load_state_dict(state_dict)
+            
+        elif suffix in [".pth", ".bin", ".pt"]:
+            checkpoint = torch.load(str(checkpoint_path), map_location=device)
+            
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                state_dict = checkpoint["state_dict"]
+                vocab_size = checkpoint.get("vocab_size", state_dict["embedding.weight"].shape[0])
+                d_model = checkpoint.get("d_model", state_dict["embedding.weight"].shape[1])
+            else:
+                state_dict = checkpoint
+                vocab_size = state_dict["embedding.weight"].shape[0]
+                d_model = state_dict["embedding.weight"].shape[1]
+            
+            cfg = get_config_from_d_model(d_model)
+            model = cls(
+                vocab_size=vocab_size,
+                d_model=d_model,
+                d_hidden=cfg["d_hidden"],
+                n_latents=cfg["n_latents"],
+                d_latent=cfg["d_latent"],
+                n_heads=cfg["n_heads"],
+                n_layers=cfg["n_layers"],
+                n_experts=cfg["n_experts"],
+                top_k=min(2, cfg["n_experts"]),
+            )
+            model.load_state_dict(state_dict)
+
+# ... existing code ...
+        else:
+            raise ValueError(f"Unsupported format: {suffix}")
+        
+        model = model.to(device)
+        model.eval()
+        return model
+    
+    def generate_text(
+        self,
+        prompt: str,
+        tokenizer,
+        max_new_tokens: int = 100,
+        temperature: float = 1.0,
+        top_k: int = 50,
+    ):
+        """
+        High-level text generation with streaming.
+        
+        Args:
+            prompt: Input text prompt
+            tokenizer: Tokenizer to use
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_k: Top-k sampling parameter
+            
+        Yields:
+            str: Decoded token strings as they are generated
+        """
+        device = next(self.parameters()).device
+        input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(device)
+        
+        for token_id in self.generate(
+            input_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            eos_token_id=tokenizer.eos_token_id,
+        ):
+            yield tokenizer.decode([token_id])
 class Trainer:
     """Training loop for HuyenGPT."""
     
@@ -771,7 +892,7 @@ if __name__ == "__main__":
     )
 
     # ========== Configuration ==========
-    BATCH_SIZE = 4
+    BATCH_SIZE = 16
     EPOCHS = 10
     LEARNING_RATE = 1e-4
     MAX_SEQ_LENGTH = 512
@@ -794,7 +915,7 @@ if __name__ == "__main__":
     prompts = df[dataset_config.input_column[0]].tolist()
     responses = df[dataset_config.output_column[0]].tolist()
     
-    MAX_SAMPLES = None  # Set to None for full dataset
+    MAX_SAMPLES = None # Set to None for full dataset
     if MAX_SAMPLES:
         prompts = prompts[:MAX_SAMPLES]
         responses = responses[:MAX_SAMPLES]
@@ -876,3 +997,24 @@ if __name__ == "__main__":
     )
     
     logger.info(f"Generated text:\n{tokenizer.decode(generated[0])}")
+
+    model = HuyenGPT.from_pretrained("./checkpoints/huyengpt_epoch_2.safetensors", device=DEVICE)
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+
+    # ========== Test Generation (Streaming) ==========
+    logger.info("\nTesting streaming generation...")
+    test_prompt = f"{TextDataset.USER_TOKEN} What is machine learning? {TextDataset.ASSISTANT_TOKEN}"
+
+    print(f"\nPrompt: {test_prompt}")
+    print("Generated: ", end="", flush=True)
+
+    for token_str in model.generate_text(
+        test_prompt,
+        tokenizer,
+        max_new_tokens=50,
+        temperature=0.8,
+        top_k=50,
+    ):
+        print(token_str, end="", flush=True)
+
+    print("\n")
