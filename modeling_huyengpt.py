@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 from transformers import AutoTokenizer
 import torch.utils.data as data
 from safetensors.torch import save_file, load_file
 
+import argparse
 import logging
 import time
 import csv
@@ -150,7 +151,7 @@ def collate_fn(batch: List[dict], pad_token_id: int) -> dict:
 
 # model variants: "large", "medium", "small", "tiny"
 # Use "tiny" for MPS/testing, "small"+ for CUDA with more VRAM
-VARIANT = "tiny"  # Changed to tiny for MPS compatibility
+VARIANT = "small"
 TOKENIZER_NAME = "google/mt5-small"
 
 # model parameters by variant
@@ -760,6 +761,8 @@ class Trainer:
         gradient_accumulation_steps: int = 1,
         max_grad_norm: float = 1.0,
         log_interval: int = 10,
+        resume_from: Optional[str] = None,
+        use_amp: bool = True,
     ) -> None:
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -770,9 +773,33 @@ class Trainer:
         self.max_grad_norm = max_grad_norm
         self.log_interval = log_interval
         
+        self.use_amp = use_amp and device.type == "cuda"
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        
         self.global_step = 0
+        self.start_epoch = 0
         self.checkpoint_dir = project_root / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        if resume_from:
+            self.load_checkpoint(resume_from)
+
+    def load_checkpoint(self, checkpoint_path: str) -> None:
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        
+        logger.info(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(str(checkpoint_path), map_location=self.device)
+        
+        self.model.load_state_dict(checkpoint["state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scaler_state_dict" in checkpoint and self.use_amp:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        self.start_epoch = checkpoint["epoch"] + 1
+        self.global_step = checkpoint.get("global_step", 0)
+        
+        logger.info(f"Resumed from epoch {self.start_epoch}, global_step {self.global_step}")
 
     def train_epoch(self, epoch: int) -> float:
         self.model.train()
@@ -784,22 +811,24 @@ class Trainer:
             labels = batch["labels"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
             
-            logits, loss = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
-            )
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
+                logits, loss = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
+                loss = loss / self.gradient_accumulation_steps
             
-            loss = loss / self.gradient_accumulation_steps
-            loss.backward()
+            self.scaler.scale(loss).backward()
             
-            # Step optimizer if accumulated enough, OR if this is the last batch
             is_accumulation_step = (batch_idx + 1) % self.gradient_accumulation_steps == 0
             is_last_batch = (batch_idx + 1) == num_batches
             
             if is_accumulation_step or is_last_batch:
+                self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.optimizer.step()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
                 self.optimizer.zero_grad()
                 self.global_step += 1
             
@@ -822,6 +851,7 @@ class Trainer:
             "global_step": self.global_step,
             "state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
             "vocab_size": self.model.vocab_size,
             "d_model": self.model.d_model,
         }
@@ -841,14 +871,14 @@ class Trainer:
 
     def train(self) -> None:
         """Full training loop."""
-        logger.info(f"Starting training for {self.epochs} epochs")
+        logger.info(f"Starting training for {self.epochs} epochs (starting from epoch {self.start_epoch + 1})")
         logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         
         best_loss = float('inf')
         start_time = time.time()
         
         try:
-            for epoch in range(self.epochs):
+            for epoch in range(self.start_epoch, self.epochs):
                 epoch_start = time.time()
                 logger.info(f"\n{'='*50}")
                 logger.info(f"Epoch {epoch + 1}/{self.epochs}")
@@ -859,7 +889,6 @@ class Trainer:
                 
                 logger.info(f"Epoch {epoch + 1} complete | Avg Loss: {avg_loss:.4f} | Time: {epoch_time:.1f}s")
                 
-                # Save checkpoint
                 is_best = avg_loss < best_loss
                 if is_best:
                     best_loss = avg_loss
@@ -881,7 +910,10 @@ if __name__ == "__main__":
     from datasets import load_dataset
     from functools import partial
     
-    # Setup logging
+    parser = argparse.ArgumentParser(description="Train HuyenGPT")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from (.pth)")
+    args = parser.parse_args()
+    
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -892,7 +924,7 @@ if __name__ == "__main__":
     )
 
     # ========== Configuration ==========
-    BATCH_SIZE = 16
+    BATCH_SIZE = 4
     EPOCHS = 10
     LEARNING_RATE = 1e-4
     MAX_SEQ_LENGTH = 512
@@ -979,42 +1011,54 @@ if __name__ == "__main__":
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
         max_grad_norm=1.0,
         log_interval=10,
+        resume_from=args.resume,
     )
     
     trainer.train()
     
-    # ========== Test Generation ==========
-    logger.info("\nTesting generation...")
-    test_prompt = f"{TextDataset.USER_TOKEN} What is machine learning? {TextDataset.ASSISTANT_TOKEN}"
-    input_ids = tokenizer(test_prompt, return_tensors="pt")["input_ids"].to(device)
+    # second phase
+    dataset_config = DatasetConfig(
+        dataset_name="Vietnamese-argilla-OpenHermesPreferences-66k-gg-translated",
+        input_column=["prompt_vi"],
+        output_column=["candidates_completions_vi"]
+    )
+
+    prompts = df[dataset_config.input_column[0]].tolist()
+    responses = df[dataset_config.output_column[0]].tolist()
     
-    generated = model.generate(
-        input_ids,
-        max_new_tokens=50,
-        temperature=0.8,
-        top_k=50,
-        eos_token_id=tokenizer.eos_token_id,
+    MAX_SAMPLES = None # Set to None for full dataset
+    if MAX_SAMPLES:
+        prompts = prompts[:MAX_SAMPLES]
+        responses = responses[:MAX_SAMPLES]
+        logger.info(f"Using {MAX_SAMPLES} samples for training")
+    
+    # ========== Create Dataset ==========
+    logger.info("Creating dataset...")
+    train_dataset = TextDataset(prompts, responses, tokenizer, max_length=MAX_SEQ_LENGTH)
+    logger.info(f"Dataset size: {len(train_dataset)} examples")
+    
+    # ========== Create DataLoader ==========
+    train_loader = data.DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        collate_fn=partial(collate_fn, pad_token_id=tokenizer.pad_token_id),
+        num_workers=0,
+        pin_memory=True if DEVICE == "cuda" else False,
+    )
+
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        optimizer=optimizer,
+        device=device,
+        epochs=EPOCHS,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+        max_grad_norm=1.0,
+        log_interval=10,
+        resume_from=args.resume,
     )
     
-    logger.info(f"Generated text:\n{tokenizer.decode(generated[0])}")
-
-    model = HuyenGPT.from_pretrained("./checkpoints/huyengpt_epoch_2.safetensors", device=DEVICE)
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-
-    # ========== Test Generation (Streaming) ==========
-    logger.info("\nTesting streaming generation...")
-    test_prompt = f"{TextDataset.USER_TOKEN} What is machine learning? {TextDataset.ASSISTANT_TOKEN}"
-
-    print(f"\nPrompt: {test_prompt}")
-    print("Generated: ", end="", flush=True)
-
-    for token_str in model.generate_text(
-        test_prompt,
-        tokenizer,
-        max_new_tokens=50,
-        temperature=0.8,
-        top_k=50,
-    ):
-        print(token_str, end="", flush=True)
-
-    print("\n")
+    trainer.train()
+    
+    
